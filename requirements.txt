@@ -1,0 +1,12 @@
+# HTTP client — used by geocoding and all Open-Meteo calls
+requests==2.31.0
+
+# Environment variable management — never hardcode keys
+python-dotenv==1.0.1
+
+# Streamlit UI (not used in Slice 1, but pin it now)
+streamlit==1.35.0
+
+# Data handling (needed from Slice 3 onward, pin early)
+pandas==2.2.2
+numpy==1.26.4
