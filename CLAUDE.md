@@ -151,5 +151,18 @@ The Claude system prompt must instruct the model to:
 
 
 ## Current Status
-All 6 slices complete. 153+ tests passing. App runs locally via `streamlit run app.py`.
+All 6 slices complete. 103+ tests passing (offline suite). App runs locally via `streamlit run app.py`.
+
+### v2 Dashboard features (added post-slice-6):
+- Wide layout with tabbed dashboard (Heat | Precipitation & Drought | Wind | Economic | Methodology)
+- City disambiguation picker — accepts "City, Country" format; shows radio picker when multiple
+  countries match
+- Multi-hazard analysis: precipitation Z-score + drought indicator + wind Z-score (all from existing ERA5 data)
+- Plotly interactive charts: temperature trend line, degree-day grouped bar, wet-bulb gauge,
+  precipitation trend, wind bar, cost range bar
+- LPCA narrative and risk scorecard promoted to top of results
+- `geocode_city_candidates()` added to geocoding.py; `geocode_city()` unchanged
+- `windspeed_10m_max` added to Open-Meteo daily variable fetch
+- `plotly==5.22.0` added to requirements.txt
+
 Next steps: Deploy to Streamlit Community Cloud. Write README.md and DECISIONS.md.

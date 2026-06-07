@@ -32,32 +32,92 @@ def geocode_city(city_input: str) -> LocationResult:
     """
     Takes a free-text city name and returns a validated LocationResult.
 
-    Strategy:
-      1. Sanitise and validate the raw input string.
-      2. Query Open-Meteo geocoding for up to MAX_RESULTS candidates.
-      3. Select best match: exact name + highest population wins.
-      4. Validate required coordinate fields are present.
-      5. Return a LocationResult with appropriate confidence flags.
-
-    Args:
-        city_input: Free-text city name, e.g. "Paris" or "  Mumbai  ".
-
-    Returns:
-        A fully populated LocationResult dataclass.
+    Accepts optional country hint: "London, UK" or "London, Ontario".
+    When a country hint is provided results are filtered to that country first.
+    The best match (exact name + highest population) is returned.
 
     Raises:
         ValueError: If the input is blank or no city is found.
         ConnectionError: If the geocoding API is unreachable or returns an error.
     """
+    candidates = geocode_city_candidates(city_input)
+    if not candidates:
+        city_name = city_input.split(",")[0].strip()
+        raise ValueError(
+            f"No geocoding results found for '{city_name}'. "
+            "Try a different spelling or a nearby major city."
+        )
+    return candidates[0]
+
+
+def geocode_city_candidates(city_input: str) -> list[LocationResult]:
+    """
+    Returns up to MAX_RESULTS candidate LocationResults, sorted by:
+      1. Exact city-name matches before fuzzy matches.
+      2. Highest population within each group.
+
+    Accepts optional country hint ("London, UK", "London, Ontario").
+    When provided, results are filtered to match that country or region first;
+    if the filter eliminates all candidates the full set is used as fallback.
+
+    Args:
+        city_input: Free-text city name, optionally with country hint after a comma.
+
+    Returns:
+        Sorted list of LocationResult (may be empty on no match).
+
+    Raises:
+        ValueError: If the input is blank or the API returns no results.
+        ConnectionError: If the geocoding API is unreachable.
+    """
     city_input = _sanitize_input(city_input)
-    raw_results = _fetch_geocoding_results(city_input)
-    best_match = _select_best_match(raw_results, city_input)
-    return _build_location_result(best_match, city_input)
+    city_name, country_hint = _parse_city_country(city_input)
+
+    raw_results = _fetch_geocoding_results(city_name)
+
+    # Apply country/region hint filter if provided
+    if country_hint:
+        hint_lower = country_hint.lower()
+        filtered = [
+            r for r in raw_results
+            if hint_lower in r.get("country", "").lower()
+            or hint_lower in r.get("country_code", "").lower()
+            or hint_lower in r.get("admin1", "").lower()
+        ]
+        if filtered:
+            raw_results = filtered
+
+    # Sort: exact city name first, then by population descending
+    name_lower = city_name.lower()
+    exact = [r for r in raw_results if r.get("name", "").lower() == name_lower]
+    rest = [r for r in raw_results if r.get("name", "").lower() != name_lower]
+    exact.sort(key=lambda r: r.get("population", 0), reverse=True)
+    rest.sort(key=lambda r: r.get("population", 0), reverse=True)
+
+    candidates: list[LocationResult] = []
+    for match in exact + rest:
+        try:
+            candidates.append(_build_location_result(match, city_name))
+        except ValueError:
+            continue
+
+    return candidates
 
 
 # ---------------------------------------------------------------------------
 # Private Helpers
 # ---------------------------------------------------------------------------
+
+def _parse_city_country(city_input: str) -> tuple[str, str]:
+    """
+    Splits 'City, Country' into (city_name, country_hint).
+    Returns (city_input, '') when no comma is present.
+    """
+    if "," in city_input:
+        parts = city_input.split(",", 1)
+        return parts[0].strip(), parts[1].strip()
+    return city_input, ""
+
 
 def _sanitize_input(city_input: str) -> str:
     """

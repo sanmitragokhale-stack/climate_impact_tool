@@ -12,3 +12,6 @@ pandas==2.2.2
 numpy==1.26.4
 
 anthropic>=0.40.0
+
+# Interactive visualisation charts
+plotly==5.22.0

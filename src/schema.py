@@ -59,6 +59,7 @@ class WeatherObservation:
     observed_temp_mean_c: float = 0.0
     observed_precip_sum_mm: float = 0.0
     dewpoint_mean_c: float = 0.0       # Required for wet-bulb calculation
+    wind_speed_max_ms: float = 0.0     # Mean of daily max wind speeds over the period (m/s)
 
     # Data provenance
     data_source: str = "open-meteo"
@@ -105,6 +106,21 @@ class ClimateContext:
 
     # Trend signal — linear regression slope on last 10 years, same calendar period
     trend_slope_c_per_decade: float = 0.0
+
+    # Precipitation anomaly
+    precip_observed_mm: float = 0.0
+    precip_baseline_mm: float = 0.0    # Mean monthly precip across 1991–2020
+    precip_z_score: float = 0.0
+    precip_anomaly_classification: str = "normal"  # "normal" | "notable" | "exceptional"
+
+    # Wind anomaly (mean of daily max wind speeds, m/s)
+    wind_speed_max_ms: float = 0.0
+    wind_baseline_ms: float = 0.0
+    wind_z_score: float = 0.0
+    wind_anomaly_classification: str = "normal"
+
+    # Drought indicator derived from multi-month precip deficit
+    drought_indicator: str = "none"    # "none" | "moderate" | "severe"
 
     # Overall confidence in this layer's output
     confidence: str = "high"           # "high" | "medium" | "low"

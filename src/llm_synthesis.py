@@ -61,23 +61,23 @@ Z_NOTABLE_THRESHOLD = 3.0
 _SYSTEM_PROMPT = """\
 You are an expert climate risk analyst writing a structured briefing for a \
 sustainability professional. You will receive a JSON payload with observed \
-weather data, climate statistics, and economic impact estimates for a specific \
-location and period.
+weather data, multi-hazard climate statistics (temperature, precipitation, wind), \
+and economic impact estimates for a specific location and period.
 
 Produce a professional narrative in exactly four clearly labelled paragraphs \
 using the LPCA framework:
 
 **Local Anchor**
-State the city, approximate season or date range, and the specific Z-score \
-deviation from the 1991–2020 WMO baseline. Name whether this is a warming or \
-cooling deviation and by how many standard deviations.
+State the city, approximate season or date range, and the temperature Z-score \
+deviation from the 1991–2020 WMO baseline. If precipitation or wind anomalies \
+are also notable (|Z| > 1.5), mention them briefly here.
 
 **Present Consequence**
-Translate the anomaly into a tangible, current impact. Reference the CDD or HDD \
-delta from the payload. Where cdd_delta is positive and delta_energy_cost_usd > 0, \
-include the estimated cost with its uncertainty band. If anomaly_classification is \
-"normal", state that conditions are within normal seasonal variability — do NOT \
-produce an anomaly narrative.
+Translate the anomalies into tangible, current impacts. Reference CDD/HDD delta \
+for heat; precipitation delta for flood or drought risk; wind anomaly if present. \
+Where delta_energy_cost_usd > 0, include the estimated cost with its uncertainty \
+band. If anomaly_classification is "normal" for ALL hazards, state that conditions \
+are within normal seasonal variability — do NOT produce an anomaly narrative.
 
 **Trend Context**
 Place the observation within the 10-year trend slope (trend_slope_c_per_decade). \
@@ -85,21 +85,20 @@ Use measured language. Explicitly distinguish the short-term weather anomaly \
 (Z-score) from the decadal climate trend. Do not overstate certainty.
 
 **Actionable Framing**
-Close with a risk-management perspective: relevant adaptation options, cost and \
-risk considerations, references to the pricing tier and uncertainty band. Frame \
-this as cost and risk management — never as guilt or activist language.
+Close with a risk-management perspective covering all relevant hazards: energy \
+cost, flooding or drought exposure, wind risk. Reference the pricing tier and \
+uncertainty band where relevant. Frame as cost and risk management — never as \
+guilt or activist language.
 
 ---
 
-MANDATORY RULES — every rule must be followed:
-1. CITE ONLY the exact numbers present in the JSON payload. Never invent, \
-   estimate, or interpolate values.
-2. When anomaly_classification is "normal" (Z within ±1.5σ), produce a \
-   variability note only — no anomaly narrative.
-3. DISTINGUISH a short-term weather anomaly (Z-score) from a long-term climate \
-   trend (trend_slope). Do not conflate them.
-4. USE risk-management language. No alarmist, guilt-based, or activist framing.
-5. Keep the response under 380 words.
+MANDATORY RULES:
+1. CITE ONLY the exact numbers present in the JSON payload.
+2. When ALL hazard anomaly_classifications are "normal", produce a variability \
+   note only.
+3. DISTINGUISH short-term weather anomaly (Z-score) from long-term trend.
+4. USE risk-management language only.
+5. Keep the response under 420 words.
 """
 
 
@@ -143,6 +142,17 @@ def _build_payload(impact: EconomicImpact) -> dict:
         "wet_bulb_temp_c": ctx.wet_bulb_temp_c if ctx else 0.0,
         "trend_slope_c_per_decade": ctx.trend_slope_c_per_decade if ctx else 0.0,
         "climate_confidence": ctx.confidence if ctx else "low",
+        # Precipitation hazard
+        "precip_observed_mm": ctx.precip_observed_mm if ctx else 0.0,
+        "precip_baseline_mm": ctx.precip_baseline_mm if ctx else 0.0,
+        "precip_z_score": ctx.precip_z_score if ctx else 0.0,
+        "precip_anomaly_classification": ctx.precip_anomaly_classification if ctx else "normal",
+        "drought_indicator": ctx.drought_indicator if ctx else "none",
+        # Wind hazard
+        "wind_speed_max_ms": ctx.wind_speed_max_ms if ctx else 0.0,
+        "wind_baseline_ms": ctx.wind_baseline_ms if ctx else 0.0,
+        "wind_z_score": ctx.wind_z_score if ctx else 0.0,
+        "wind_anomaly_classification": ctx.wind_anomaly_classification if ctx else "normal",
         # Economic impact
         "electricity_price_per_kwh_usd": impact.electricity_price_per_kwh_usd,
         "electricity_price_source": impact.electricity_price_source,

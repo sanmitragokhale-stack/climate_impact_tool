@@ -1,526 +1,972 @@
 """
 app.py
 
-Streamlit entrypoint for the Climate Impact Portfolio Tool.
+Streamlit dashboard entrypoint for the Climate Impact Portfolio Tool.
 
-Runs the five-slice pipeline in order and displays structured results:
-  Slice 1 — geocoding.py      → LocationResult
-  Slice 2 — weather.py        → WeatherObservation + baseline series
-  Slice 3 — climate_stats.py  → ClimateContext
-  Slice 4 — economic_impact.py → EconomicImpact
-  Slice 5 — llm_synthesis.py  → LPCA narrative string
+Pipeline order (five slices):
+  1. geocoding.py      → LocationResult
+  2. weather.py        → WeatherObservation + baseline series
+  3. climate_stats.py  → ClimateContext   (temp + precip + wind + drought)
+  4. economic_impact.py → EconomicImpact
+  5. llm_synthesis.py  → LPCA narrative string
 
-All errors are caught and shown as clean user-facing messages.
+UI layout:
+  - Wide layout, city disambiguation picker
+  - Risk summary scorecard at top
+  - LPCA narrative immediately below
+  - Tabs: Heat | Precipitation & Drought | Wind | Economic | Methodology
+  - Plotly charts throughout
 """
 
 import streamlit as st
 from datetime import datetime
+from statistics import mean
 
-from src.geocoding import geocode_city
+import plotly.graph_objects as go
+
+from src.geocoding import geocode_city_candidates
 from src.weather import fetch_weather_observation, fetch_baseline_series
 from src.climate_stats import compute_climate_context
 from src.economic_impact import compute_economic_impact
 from src.llm_synthesis import synthesize_narrative
+from src.schema import LocationResult
 
 
 # ---------------------------------------------------------------------------
-# Constants — must match climate_stats.py thresholds
-# ---------------------------------------------------------------------------
-
-Z_NORMAL_THRESHOLD = 1.5
-Z_NOTABLE_THRESHOLD = 3.0
-
-
-# ---------------------------------------------------------------------------
-# Page configuration
+# Page config
 # ---------------------------------------------------------------------------
 
 st.set_page_config(
     page_title="Climate Impact Portfolio Tool",
     page_icon="🌍",
-    layout="centered",
+    layout="wide",
 )
 
 # ---------------------------------------------------------------------------
-# Header
+# Custom CSS — tighten metric tiles and section headers
 # ---------------------------------------------------------------------------
 
-st.title("🌍 Climate Impact Portfolio Tool")
-st.markdown(
-    "Analyse observed weather conditions against the **1991–2020 WMO 30-year "
-    "climatological baseline** for any city worldwide. Computes Z-score anomalies, "
-    "Cooling/Heating Degree Day deviations, wet-bulb heat stress, and localised "
-    "energy cost impacts — then synthesises a structured LPCA narrative."
-)
-st.divider()
+st.markdown("""
+<style>
+[data-testid="stMetricLabel"] { font-size: 0.78rem; }
+[data-testid="stMetricValue"] { font-size: 1.25rem; font-weight: 600; }
+div[data-testid="stTabs"] [data-baseweb="tab"] { font-size: 0.9rem; font-weight: 500; }
+.section-header {
+    font-size: 1.05rem;
+    font-weight: 600;
+    color: #333;
+    border-bottom: 2px solid #e0e0e0;
+    padding-bottom: 4px;
+    margin-bottom: 8px;
+}
+</style>
+""", unsafe_allow_html=True)
+
 
 # ---------------------------------------------------------------------------
-# City input form
+# Z-score thresholds (must match climate_stats.py)
 # ---------------------------------------------------------------------------
 
-with st.form("city_form"):
-    city_input = st.text_input(
-        "Enter a city name",
-        placeholder="e.g. Mumbai, London, Chicago, Singapore, Nairobi",
-        help="The tool resolves your input via the Open-Meteo Geocoding API.",
+Z_NORMAL = 1.5
+Z_EXCEPTIONAL = 3.0
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def _z_badge(z: float, label: str) -> str:
+    abs_z = abs(z)
+    if abs_z <= Z_NORMAL:
+        icon = "🟢"
+    elif abs_z <= Z_EXCEPTIONAL:
+        icon = "🟡"
+    else:
+        icon = "🔴"
+    direction = f"+{abs_z:.1f}σ" if z >= 0 else f"−{abs_z:.1f}σ"
+    return f"{icon} {label}: {direction}"
+
+
+def _anomaly_color(classification: str, positive_is_bad: bool = True) -> str:
+    if classification == "exceptional":
+        return "#d62728"
+    if classification == "notable":
+        return "#ff7f0e"
+    return "#2ca02c"
+
+
+def _year_annual_means(baseline_series: list[dict]) -> tuple[list[int], list[float]]:
+    """Returns (years, annual_mean_temps) for the full 1991–2020 baseline."""
+    year_data: dict[int, list[float]] = {}
+    for r in baseline_series:
+        if r["temp_mean_c"] is not None:
+            yr = int(r["date"][:4])
+            year_data.setdefault(yr, []).append(r["temp_mean_c"])
+    years = sorted(year_data.keys())
+    means = [mean(year_data[y]) for y in years]
+    return years, means
+
+
+def _year_annual_precip(baseline_series: list[dict]) -> tuple[list[int], list[float]]:
+    """Returns (years, annual_precip_totals_mm) for the baseline."""
+    year_data: dict[int, float] = {}
+    for r in baseline_series:
+        if r.get("precip_sum_mm") is not None:
+            yr = int(r["date"][:4])
+            year_data[yr] = year_data.get(yr, 0.0) + r["precip_sum_mm"]
+    years = sorted(year_data.keys())
+    totals = [year_data[y] for y in years]
+    return years, totals
+
+
+def _linear_fit(x: list[int], y: list[float]) -> tuple[list[float], float]:
+    """Returns (fitted_y_values, slope_per_unit_x)."""
+    n = len(x)
+    if n < 2:
+        return y, 0.0
+    x_mean = mean(x)
+    y_mean = mean(y)
+    num = sum((xi - x_mean) * (yi - y_mean) for xi, yi in zip(x, y))
+    den = sum((xi - x_mean) ** 2 for xi in x)
+    if den == 0:
+        return [y_mean] * n, 0.0
+    slope = num / den
+    intercept = y_mean - slope * x_mean
+    fitted = [slope * xi + intercept for xi in x]
+    return fitted, slope
+
+
+# ---------------------------------------------------------------------------
+# Session state initialisation
+# ---------------------------------------------------------------------------
+
+for key in ("candidates", "location", "results"):
+    if key not in st.session_state:
+        st.session_state[key] = None
+
+
+# ---------------------------------------------------------------------------
+# Sidebar — input form
+# ---------------------------------------------------------------------------
+
+with st.sidebar:
+    st.image("https://upload.wikimedia.org/wikipedia/commons/thumb/e/e0/SNice.svg/220px-SNice.svg.png",
+             width=40) if False else None  # placeholder guard
+    st.title("🌍 Climate Impact\nPortfolio Tool")
+    st.caption("Powered by ERA5 · Open-Meteo · Claude Haiku")
+    st.divider()
+
+    with st.form("city_form"):
+        city_input = st.text_input(
+            "City (optionally add country)",
+            placeholder="e.g. London, UK  ·  Mumbai  ·  Chicago, Illinois",
+            help="Type a city name. Add a country or region after a comma to narrow results.",
+        )
+        submitted = st.form_submit_button("🔍 Search", use_container_width=True)
+
+    if submitted and city_input.strip():
+        with st.spinner("Searching…"):
+            try:
+                candidates = geocode_city_candidates(city_input.strip())
+                st.session_state["candidates"] = candidates
+                st.session_state["location"] = None
+                st.session_state["results"] = None
+            except ValueError as e:
+                st.error(str(e))
+            except ConnectionError as e:
+                st.error(f"Geocoding unavailable: {e}")
+
+    # --- Disambiguation picker ---
+    candidates = st.session_state.get("candidates") or []
+    if candidates and st.session_state.get("location") is None:
+        unique_countries = {c.country_code for c in candidates}
+        if len(candidates) > 1 and len(unique_countries) > 1:
+            st.divider()
+            st.markdown("**Multiple cities found — select one:**")
+            options = []
+            for c in candidates:
+                pop = f"  pop. {c.population:,}" if c.population else ""
+                options.append(f"{c.city_name}, {c.country}{pop}")
+            with st.form("disambig_form"):
+                chosen_label = st.radio("", options, label_visibility="collapsed")
+                confirm = st.form_submit_button("Analyse this city", use_container_width=True)
+            if confirm:
+                idx = options.index(chosen_label)
+                st.session_state["location"] = candidates[idx]
+        else:
+            # Single result or all same country — auto-select best
+            st.session_state["location"] = candidates[0]
+
+    st.divider()
+    st.caption(
+        "**Baseline:** 1991–2020 WMO 30-yr normal  \n"
+        "**Anomaly metric:** Z-score  \n"
+        "**Heat stress:** Stull (2011) wet-bulb  \n"
+        "**Data:** Open-Meteo ERA5 archive"
     )
-    submitted = st.form_submit_button(
-        "Analyse Climate Impact", use_container_width=True
-    )
+
 
 # ---------------------------------------------------------------------------
-# Pipeline — only runs when the form is submitted
+# Pipeline — runs once per location selection
 # ---------------------------------------------------------------------------
 
-if not submitted:
-    st.stop()
+location: LocationResult | None = st.session_state.get("location")
 
-if not city_input.strip():
-    st.error("Please enter a city name before submitting.")
-    st.stop()
+if location is not None and st.session_state.get("results") is None:
+    progress = st.empty()
+    try:
+        with progress.container():
+            st.info(f"Running analysis for **{location.city_name}, {location.country}**…")
 
-try:
-
-    # ── Stage 1: Geocode ─────────────────────────────────────────────────────
-
-    with st.spinner(f"Locating **{city_input.strip()}** on the map…"):
-        try:
-            location = geocode_city(city_input)
-        except ValueError as exc:
-            st.error(
-                f"**City not found.** {exc}\n\n"
-                "Try a different spelling, add the country name (e.g. 'Springfield, Illinois'), "
-                "or use a nearby major city."
-            )
-            st.stop()
-        except ConnectionError as exc:
-            st.error(
-                f"**Geocoding service unavailable.** Check your internet connection and try again.\n\n"
-                f"Detail: {exc}"
-            )
-            st.stop()
-
-    # ── Stage 2: Weather observation + 30-year baseline ──────────────────────
-
-    with st.spinner(
-        f"Fetching recent weather and 30-year baseline for **{location.city_name}**… "
-        "(30–60 seconds — downloading ERA5 reanalysis data)"
-    ):
-        try:
+        with st.spinner("Fetching weather observation…"):
             observation = fetch_weather_observation(location)
-        except ValueError as exc:
-            st.error(f"**Weather data error:** {exc}")
-            st.stop()
-        except ConnectionError as exc:
-            st.error(
-                f"**Open-Meteo archive API unavailable.** Try again in a moment.\n\nDetail: {exc}"
-            )
-            st.stop()
 
         try:
             obs_month = datetime.fromisoformat(observation.date_range_end).month
         except (ValueError, TypeError):
             obs_month = datetime.now().month
 
-        try:
+        with st.spinner("Downloading 30-year ERA5 baseline (30–60 s)…"):
             baseline_series = fetch_baseline_series(location, obs_month)
-        except ValueError as exc:
-            st.error(f"**Baseline data error:** {exc}")
-            st.stop()
-        except ConnectionError as exc:
-            st.error(
-                f"**Open-Meteo archive API unavailable (baseline fetch).** "
-                f"Try again in a moment.\n\nDetail: {exc}"
-            )
-            st.stop()
 
-    # ── Stage 3: Climate statistics ──────────────────────────────────────────
-
-    with st.spinner(
-        "Computing Z-score anomaly and degree-day statistics "
-        "against the 1991–2020 WMO baseline…"
-    ):
-        try:
+        with st.spinner("Computing climate statistics…"):
             climate_ctx = compute_climate_context(observation, baseline_series)
-        except ValueError as exc:
-            st.error(f"**Climate statistics error:** {exc}")
-            st.stop()
 
-    # ── Stage 4: Economic impact ──────────────────────────────────────────────
+        with st.spinner("Estimating economic impact…"):
+            economic = compute_economic_impact(climate_ctx)
 
-    with st.spinner("Estimating localised energy cost impact…"):
-        economic = compute_economic_impact(climate_ctx)
+        with st.spinner("Generating LPCA narrative…"):
+            narrative = synthesize_narrative(economic)
 
-    # ── Stage 5: Narrative synthesis ─────────────────────────────────────────
+        st.session_state["results"] = {
+            "location": location,
+            "observation": observation,
+            "baseline_series": baseline_series,
+            "climate_ctx": climate_ctx,
+            "economic": economic,
+            "narrative": narrative,
+        }
+        progress.empty()
 
-    with st.spinner(
-        "Generating LPCA narrative (Claude Haiku) — "
-        "falling back to template if API unavailable…"
-    ):
-        narrative = synthesize_narrative(economic)
+    except ValueError as exc:
+        progress.empty()
+        st.error(f"**Data error:** {exc}")
+        st.stop()
+    except ConnectionError as exc:
+        progress.empty()
+        st.error(f"**Connection error:** {exc}")
+        st.stop()
+    except Exception as exc:
+        progress.empty()
+        st.error(f"**Unexpected error:** `{type(exc).__name__}: {exc}`")
+        st.stop()
 
-except Exception as exc:
-    st.error(
-        "**An unexpected error occurred.** The pipeline hit an unhandled condition.\n\n"
-        f"Detail: `{type(exc).__name__}: {exc}`\n\n"
-        "Please try a different city, or report the issue."
+
+# ---------------------------------------------------------------------------
+# Landing state — no results yet
+# ---------------------------------------------------------------------------
+
+results = st.session_state.get("results")
+
+if results is None:
+    st.markdown("## Welcome to the Climate Impact Portfolio Tool")
+    st.markdown(
+        "Enter a city name in the sidebar to run a full multi-hazard climate risk analysis "
+        "against the **1991–2020 WMO 30-year climatological baseline**.\n\n"
+        "**What this tool analyses:**\n"
+        "- 🌡️ **Heat stress** — temperature Z-score, CDD/HDD anomaly, wet-bulb heat index\n"
+        "- 🌧️ **Precipitation & drought** — rainfall anomaly, flood risk signal, drought indicator\n"
+        "- 💨 **Wind** — wind speed anomaly vs. 30-year baseline\n"
+        "- 💰 **Economic impact** — additional energy cost using 5-tier regional pricing\n"
+        "- 📖 **LPCA narrative** — AI-generated risk briefing grounded in the data"
     )
+    col1, col2, col3 = st.columns(3)
+    with col1:
+        st.info("**Try:** London, UK")
+    with col2:
+        st.info("**Try:** Mumbai")
+    with col3:
+        st.info("**Try:** Chicago, Illinois")
     st.stop()
 
 
 # ===========================================================================
-# Results display
+# Results dashboard
 # ===========================================================================
 
-st.success("✅ Analysis complete")
-st.divider()
+loc = results["location"]
+obs = results["observation"]
+ctx = results["climate_ctx"]
+eco = results["economic"]
+narrative = results["narrative"]
+baseline_series = results["baseline_series"]
+
 
 # ---------------------------------------------------------------------------
-# 1. City header + coordinates
+# Top header row
 # ---------------------------------------------------------------------------
 
-st.subheader(f"📍 {location.city_name}, {location.country}")
-
-col_a, col_b, col_c = st.columns(3)
-with col_a:
-    st.metric("Region / State", location.admin_region or "—")
-with col_b:
-    st.metric("Latitude", f"{location.latitude:.4f}°")
-with col_c:
-    st.metric("Longitude", f"{location.longitude:.4f}°")
-
-meta_parts = [
-    f"Observation window: **{observation.date_range_start}** → **{observation.date_range_end}**",
-    f"Source: {observation.data_source}",
-]
-if location.population:
-    meta_parts.append(f"City population: {location.population:,}")
-st.caption("  ·  ".join(meta_parts))
-
-if observation.data_quality_flag == "partial":
-    st.warning(
-        "⚠️ **Partial observed data** — More than 15% of daily temperature values "
-        "were missing for this period. Results may be less reliable."
-    )
-
-# ---------------------------------------------------------------------------
-# 2. Geocoding confidence badge
-# ---------------------------------------------------------------------------
-
-conf = location.match_confidence
-if conf == "high":
-    st.success("✅ **High confidence match** — Exact name and population data confirmed.")
-elif conf == "medium":
-    note = f"\n\n_{location.match_note}_" if location.match_note else ""
-    st.warning(f"⚠️ **Medium confidence match** — Exact name match; population data unavailable.{note}")
-else:
-    note = f"\n\n_{location.match_note}_" if location.match_note else ""
-    st.error(
-        f"🔴 **Low confidence match** — The returned city name differs from your input. "
-        f"Verify this is the intended location before relying on results.{note}"
-    )
-
-st.divider()
-
-# ---------------------------------------------------------------------------
-# 3. Z-score + anomaly classification
-# ---------------------------------------------------------------------------
-
-st.subheader("Climate Anomaly Signal")
-
-z = climate_ctx.z_score
-classification = climate_ctx.anomaly_classification
-abs_z = abs(z)
-direction_word = "warmer" if z > 0 else "cooler"
-
-col_z1, col_z2, col_z3 = st.columns(3)
-with col_z1:
-    st.metric("Z-score", f"{z:+.2f} σ")
-with col_z2:
-    st.metric("Observed temp. (period mean)", f"{observation.observed_temp_mean_c:.1f} °C")
-with col_z3:
-    st.metric(
-        "Baseline mean (1991–2020)",
-        f"{climate_ctx.baseline_mean_c:.1f} °C",
-        delta=f"σ = {climate_ctx.baseline_stddev_c:.2f} °C",
-        delta_color="off",
-    )
-
-# Anomaly interpretation box
-if abs_z <= Z_NORMAL_THRESHOLD:
-    st.info(
-        f"🔵 **Within Normal Variability** — Z-score of **{z:+.2f}σ** is within "
-        f"±{Z_NORMAL_THRESHOLD}σ of the 1991–2020 baseline. This represents normal "
-        "seasonal variability, not a statistically significant climate anomaly. "
-        "No anomaly narrative is generated for observations within this threshold."
-    )
-elif abs_z > Z_NOTABLE_THRESHOLD:
-    st.error(
-        f"🔴 **Exceptional anomaly** — {location.city_name} was **{abs_z:.2f} standard "
-        f"deviations {direction_word}** than the 1991–2020 WMO baseline "
-        f"(Z = {z:+.2f}σ). This is a statistically exceptional departure (|Z| > 3.0σ)."
-    )
-else:
-    st.warning(
-        f"🟡 **Notable anomaly** — {location.city_name} was **{abs_z:.2f} standard "
-        f"deviations {direction_word}** than the 1991–2020 WMO baseline "
-        f"(Z = {z:+.2f}σ). This is a notable climate-context weather anomaly "
-        f"(1.5σ < |Z| ≤ 3.0σ)."
-    )
-
-st.divider()
-
-# ---------------------------------------------------------------------------
-# 4. CDD / HDD delta
-# ---------------------------------------------------------------------------
-
-st.subheader("Degree Day Analysis")
-st.caption(
-    "Cooling Degree Days (CDD) and Heating Degree Days (HDD) — base temperature "
-    "18 °C (WMO standard). Higher CDD = more cooling demand; higher HDD = more "
-    "heating demand."
-)
-
-col_cdd1, col_cdd2, col_cdd3 = st.columns(3)
-with col_cdd1:
-    st.metric("CDD observed", f"{climate_ctx.cdd_observed:.0f} °·days")
-with col_cdd2:
-    st.metric("CDD baseline (1991–2020 mean)", f"{climate_ctx.cdd_baseline:.0f} °·days")
-with col_cdd3:
-    cdd_delta = climate_ctx.cdd_delta
-    delta_sign = "+" if cdd_delta >= 0 else ""
-    st.metric("CDD delta", f"{delta_sign}{cdd_delta:.0f} °·days")
-
-col_hdd1, col_hdd2, col_hdd3 = st.columns(3)
-with col_hdd1:
-    st.metric("HDD observed", f"{climate_ctx.hdd_observed:.0f} °·days")
-with col_hdd2:
-    st.metric("HDD baseline (1991–2020 mean)", f"{climate_ctx.hdd_baseline:.0f} °·days")
-with col_hdd3:
-    hdd_delta = climate_ctx.hdd_delta
-    delta_sign = "+" if hdd_delta >= 0 else ""
-    st.metric("HDD delta", f"{delta_sign}{hdd_delta:.0f} °·days")
-
-# Plain-English interpretations
-if cdd_delta > 5:
-    st.info(
-        f"🌡️ **Elevated cooling demand** — {cdd_delta:.0f} additional Cooling Degree Days "
-        "above the historical baseline indicate increased grid load and air conditioning demand "
-        "compared to normal conditions for this period."
-    )
-elif cdd_delta < -5:
-    st.info(
-        f"❄️ **Reduced cooling demand** — {abs(cdd_delta):.0f} fewer Cooling Degree Days "
-        "than the historical baseline suggest below-average cooling requirements for this period."
-    )
-
-if hdd_delta > 5:
-    st.info(
-        f"🔥 **Elevated heating demand** — {hdd_delta:.0f} additional Heating Degree Days "
-        "above the historical baseline indicate increased energy demand for space heating."
-    )
-elif hdd_delta < -5:
-    st.info(
-        f"🌤️ **Reduced heating demand** — {abs(hdd_delta):.0f} fewer Heating Degree Days "
-        "than the historical baseline suggest below-average heating requirements for this period."
-    )
-
-st.divider()
-
-# ---------------------------------------------------------------------------
-# 5. Wet-bulb temperature
-# ---------------------------------------------------------------------------
-
-st.subheader("Heat Stress Indicator")
-st.caption("Wet-bulb temperature via the Stull (2011) approximation — the primary heat stress metric.")
-
-wb = climate_ctx.wet_bulb_temp_c
-
-if wb == 0.0:
-    st.warning(
-        "⚠️ **Wet-bulb temperature unavailable** — Dewpoint data was not returned by the "
-        "archive API for this location and period. The Stull (2011) approximation requires "
-        "dewpoint to compute wet-bulb temperature."
-    )
-else:
-    col_wb1, col_wb2, col_wb3 = st.columns(3)
-    with col_wb1:
-        st.metric(
-            "Wet-bulb temperature",
-            f"{wb:.1f} °C",
-            help="Stull (2011) — requires dewpoint. Accurate within ±1 °C for T 5–40 °C, RH 5–99%.",
-        )
-    with col_wb2:
-        st.metric("Dry-bulb temperature", f"{observation.observed_temp_mean_c:.1f} °C")
-    with col_wb3:
-        st.metric("Dewpoint (period mean)", f"{observation.dewpoint_mean_c:.1f} °C")
-
-    if wb >= 35:
-        st.error(
-            "🚨 **Extreme heat stress (≥35 °C wet-bulb)** — Physiologically dangerous for most "
-            "humans. Risk of hyperthermia even for healthy individuals at rest in shade."
-        )
-    elif wb >= 31:
-        st.error(
-            "🔴 **High heat stress (31–34 °C wet-bulb)** — Dangerous for vulnerable populations "
-            "and those engaged in outdoor physical activity. Significant cooling demand expected."
-        )
-    elif wb >= 28:
-        st.warning(
-            "🟡 **Moderate-high heat stress (28–30 °C wet-bulb)** — Conditions cause thermal "
-            "discomfort. Elevated cooling demand and heat-health advisories may apply."
-        )
-    elif wb >= 24:
-        st.info(f"🔵 Wet-bulb of {wb:.1f} °C — mild heat stress range. Generally manageable for most.")
-    else:
-        st.caption(f"Wet-bulb of {wb:.1f} °C — within comfortable range for most conditions.")
-
-st.divider()
-
-# ---------------------------------------------------------------------------
-# 6. Economic impact
-# ---------------------------------------------------------------------------
-
-st.subheader("Economic Impact Estimate")
-st.caption(
-    "Additional cooling energy expenditure attributable to the CDD anomaly — "
-    "per 100 m² residential unit for the observation period."
-)
-
-tier = economic.electricity_price_tier
-cost = economic.delta_energy_cost_usd
-uncertainty = economic.uncertainty_band_pct
-price = economic.electricity_price_per_kwh_usd
-source = economic.electricity_price_source
-
-# Tier 4/5 proxy warning — prominently displayed per CLAUDE.md requirement
-if tier >= 4:
-    st.warning(
-        f"⚠️ **Estimated — Regional Proxy** — {location.city_name} ({location.country}) "
-        f"falls into Pricing **Tier {tier}** ({source}). No direct electricity price data "
-        f"is available for this country. The estimate carries a **±{uncertainty:.0f}% "
-        f"uncertainty band** and should be treated as an indicative order-of-magnitude "
-        f"figure only."
-    )
-
-tier_icons = {1: "🟢", 2: "🟢", 3: "🟡", 4: "🟠", 5: "🔴"}
-tier_icon = tier_icons.get(tier, "⚪")
-
-col_e1, col_e2, col_e3 = st.columns(3)
-with col_e1:
-    st.metric(
-        f"Electricity price  {tier_icon} Tier {tier}",
-        f"${price:.3f} / kWh",
-        help=f"Source: {source}",
-    )
-with col_e2:
-    st.metric("Uncertainty band", f"±{uncertainty:.0f}%")
-with col_e3:
-    st.metric("Economic confidence", economic.confidence.capitalize())
-
-if cost > 0:
-    margin = cost * uncertainty / 100.0
-    low_c = max(0.0, cost - margin)
-    high_c = cost + margin
-    st.metric(
-        "Est. additional cooling cost",
-        f"${cost:.2f} USD",
-        delta=f"Range: ${low_c:.2f} – ${high_c:.2f} USD",
-        delta_color="inverse",
-    )
-    st.caption(f"_{economic.per_unit_description}_")
-    proxy_note = "  ·  Estimated — Regional Proxy" if tier >= 4 else ""
+hcol1, hcol2 = st.columns([3, 1])
+with hcol1:
+    st.markdown(f"## 📍 {loc.city_name}, {loc.country}")
+    region_str = f"{loc.admin_region}  ·  " if loc.admin_region else ""
+    pop_str = f"Pop. {loc.population:,}  ·  " if loc.population else ""
     st.caption(
-        f"Tier {tier} · {source}{proxy_note}  ·  "
-        f"Confidence: {economic.confidence}"
+        f"{region_str}{pop_str}"
+        f"Lat {loc.latitude:.3f}°  Lon {loc.longitude:.3f}°  ·  "
+        f"Observation: {obs.date_range_start} → {obs.date_range_end}  ·  "
+        f"Source: {obs.data_source}"
     )
-else:
-    st.info(
-        "💡 **No additional cooling cost estimated.** The observed CDD is at or below "
-        "the 1991–2020 baseline — no excess cooling expenditure is attributable to this period."
-    )
+with hcol2:
+    # Geocoding confidence badge
+    conf = loc.match_confidence
+    if conf == "high":
+        st.success("✅ High confidence match")
+    elif conf == "medium":
+        st.warning("⚠️ Medium confidence match")
+    else:
+        st.error("🔴 Low confidence — verify location")
 
-if climate_ctx.confidence_note:
-    with st.expander("Data quality notes", expanded=False):
-        st.caption(climate_ctx.confidence_note)
+if obs.data_quality_flag == "partial":
+    st.warning("⚠️ **Partial observed data** — >15% of daily temperature values missing. Results may be less reliable.")
 
 st.divider()
 
+
 # ---------------------------------------------------------------------------
-# 7. LPCA narrative
+# Risk scorecard — one tile per hazard
 # ---------------------------------------------------------------------------
 
-st.subheader("LPCA Climate Narrative")
+st.markdown('<p class="section-header">Risk Scorecard</p>', unsafe_allow_html=True)
+
+sc1, sc2, sc3, sc4, sc5 = st.columns(5)
+
+with sc1:
+    z = ctx.z_score
+    delta_str = f"{'↑' if z > 0 else '↓'} {abs(z):.2f}σ vs baseline"
+    st.metric("🌡️ Heat Z-score", f"{z:+.2f} σ", delta_str,
+              delta_color="inverse" if z > 0 else "normal")
+
+with sc2:
+    wb = ctx.wet_bulb_temp_c
+    wb_val = f"{wb:.1f} °C" if wb > 0 else "N/A"
+    wb_label = ("🔴 Extreme" if wb >= 35 else
+                "🔴 High" if wb >= 31 else
+                "🟡 Moderate" if wb >= 28 else
+                "🟢 Low")
+    st.metric("💧 Wet-bulb", wb_val, wb_label if wb > 0 else "No dewpoint data",
+              delta_color="off")
+
+with sc3:
+    pz = ctx.precip_z_score
+    pdir = "wetter" if pz > 0 else "drier"
+    pcls = ctx.precip_anomaly_classification
+    p_icon = "🔴" if pcls == "exceptional" else "🟡" if pcls == "notable" else "🟢"
+    st.metric("🌧️ Precip Z-score", f"{pz:+.2f} σ",
+              f"{p_icon} {abs(pz):.1f}σ {pdir}",
+              delta_color="off")
+
+with sc4:
+    wz = ctx.wind_z_score
+    wcls = ctx.wind_anomaly_classification
+    w_icon = "🔴" if wcls == "exceptional" else "🟡" if wcls == "notable" else "🟢"
+    wval = f"{ctx.wind_speed_max_ms:.1f} m/s" if ctx.wind_speed_max_ms > 0 else "N/A"
+    st.metric("💨 Wind speed", wval,
+              f"{w_icon} {wz:+.2f}σ" if ctx.wind_speed_max_ms > 0 else "No data",
+              delta_color="off")
+
+with sc5:
+    cost = eco.delta_energy_cost_usd
+    if cost > 0:
+        st.metric("💰 Extra cooling cost",
+                  f"${cost:.2f} USD",
+                  f"±{eco.uncertainty_band_pct:.0f}% · Tier {eco.electricity_price_tier}",
+                  delta_color="inverse")
+    else:
+        st.metric("💰 Extra cooling cost", "None", "At or below baseline", delta_color="off")
+
+st.divider()
+
+
+# ---------------------------------------------------------------------------
+# LPCA Narrative — prominent, above all detail tabs
+# ---------------------------------------------------------------------------
+
+st.markdown('<p class="section-header">📋 Climate Risk Briefing (LPCA)</p>',
+            unsafe_allow_html=True)
 st.caption(
     "Structured four-beat analysis: **L**ocal anchor · **P**resent consequence · "
     "**C**limate trend context · **A**ctionable framing"
 )
-
 with st.container(border=True):
     st.markdown(narrative)
 
 st.divider()
 
+
 # ---------------------------------------------------------------------------
-# 8. Methodology & Data Sources expander
+# Detail tabs
 # ---------------------------------------------------------------------------
 
-with st.expander("📚 Methodology & Data Sources", expanded=False):
+tab_heat, tab_precip, tab_wind, tab_econ, tab_method = st.tabs([
+    "🌡️  Heat",
+    "🌧️  Precipitation & Drought",
+    "💨  Wind",
+    "💰  Economic Impact",
+    "📚  Methodology",
+])
+
+
+# ── Tab: Heat ────────────────────────────────────────────────────────────────
+
+with tab_heat:
+    st.markdown("### Temperature Anomaly & Heat Stress")
+
+    col_left, col_right = st.columns([1, 1], gap="large")
+
+    with col_left:
+        st.markdown('<p class="section-header">Anomaly Signal</p>', unsafe_allow_html=True)
+
+        z = ctx.z_score
+        abs_z = abs(z)
+        direction_word = "warmer" if z > 0 else "cooler"
+
+        mc1, mc2, mc3 = st.columns(3)
+        with mc1:
+            st.metric("Z-score", f"{z:+.2f} σ")
+        with mc2:
+            st.metric("Observed temp.", f"{obs.observed_temp_mean_c:.1f} °C")
+        with mc3:
+            st.metric("Baseline mean", f"{ctx.baseline_mean_c:.1f} °C",
+                      delta=f"σ = {ctx.baseline_stddev_c:.2f} °C", delta_color="off")
+
+        cls = ctx.anomaly_classification
+        if abs_z <= Z_NORMAL:
+            st.info(f"🔵 **Within normal variability** — Z = {z:+.2f}σ (threshold ±{Z_NORMAL}σ).")
+        elif abs_z > Z_EXCEPTIONAL:
+            st.error(f"🔴 **Exceptional anomaly** — {abs_z:.2f}σ {direction_word} than baseline.")
+        else:
+            st.warning(f"🟡 **Notable anomaly** — {abs_z:.2f}σ {direction_word} than baseline.")
+
+        st.markdown('<p class="section-header" style="margin-top:16px">Degree Days</p>',
+                    unsafe_allow_html=True)
+        dc1, dc2, dc3 = st.columns(3)
+        with dc1:
+            st.metric("CDD observed", f"{ctx.cdd_observed:.0f} °·days")
+        with dc2:
+            st.metric("CDD baseline", f"{ctx.cdd_baseline:.0f} °·days")
+        with dc3:
+            d = ctx.cdd_delta
+            st.metric("CDD delta", f"{d:+.0f} °·days", delta_color="inverse" if d > 0 else "normal")
+
+        dh1, dh2, dh3 = st.columns(3)
+        with dh1:
+            st.metric("HDD observed", f"{ctx.hdd_observed:.0f} °·days")
+        with dh2:
+            st.metric("HDD baseline", f"{ctx.hdd_baseline:.0f} °·days")
+        with dh3:
+            dh = ctx.hdd_delta
+            st.metric("HDD delta", f"{dh:+.0f} °·days", delta_color="inverse" if dh > 0 else "normal")
+
+        st.markdown('<p class="section-header" style="margin-top:16px">Wet-bulb Heat Stress</p>',
+                    unsafe_allow_html=True)
+        wb = ctx.wet_bulb_temp_c
+        if wb == 0.0:
+            st.warning("⚠️ Wet-bulb unavailable — dewpoint not returned by archive API.")
+        else:
+            wb1, wb2, wb3 = st.columns(3)
+            with wb1:
+                st.metric("Wet-bulb (Stull 2011)", f"{wb:.1f} °C")
+            with wb2:
+                st.metric("Dry-bulb", f"{obs.observed_temp_mean_c:.1f} °C")
+            with wb3:
+                st.metric("Dewpoint", f"{obs.dewpoint_mean_c:.1f} °C")
+
+            if wb >= 35:
+                st.error("🚨 **Extreme heat stress (≥35 °C)** — physiologically dangerous.")
+            elif wb >= 31:
+                st.error("🔴 **High heat stress (31–34 °C)** — dangerous for vulnerable groups.")
+            elif wb >= 28:
+                st.warning("🟡 **Moderate-high heat stress (28–30 °C)**.")
+            elif wb >= 24:
+                st.info(f"🔵 Mild heat stress — {wb:.1f} °C.")
+            else:
+                st.caption(f"Wet-bulb {wb:.1f} °C — comfortable range.")
+
+    with col_right:
+        st.markdown('<p class="section-header">30-Year Temperature Trend (1991–2020)</p>',
+                    unsafe_allow_html=True)
+
+        years, ann_means = _year_annual_means(baseline_series)
+        fitted, slope = _linear_fit(years, ann_means)
+
+        b_mean = ctx.baseline_mean_c
+        b_std = ctx.baseline_stddev_c
+
+        fig_trend = go.Figure()
+        fig_trend.add_trace(go.Scatter(
+            x=years, y=ann_means,
+            mode="lines+markers",
+            name="Annual mean (baseline)",
+            line=dict(color="#1f77b4", width=1.5),
+            marker=dict(size=5),
+        ))
+        fig_trend.add_trace(go.Scatter(
+            x=years, y=fitted,
+            mode="lines",
+            name=f"Trend ({slope * 10:+.2f} °C/decade)",
+            line=dict(color="#d62728", width=2, dash="dot"),
+        ))
+        # ±1σ band
+        fig_trend.add_hrect(
+            y0=b_mean - b_std, y1=b_mean + b_std,
+            fillcolor="rgba(31,119,180,0.08)",
+            line_width=0,
+            annotation_text="±1σ band",
+            annotation_position="top left",
+        )
+        fig_trend.add_hline(
+            y=b_mean, line_dash="dash", line_color="grey", line_width=1,
+            annotation_text=f"Mean {b_mean:.1f}°C",
+        )
+        # Observed period mean as a scatter point
+        obs_year = datetime.fromisoformat(obs.date_range_end).year
+        fig_trend.add_trace(go.Scatter(
+            x=[obs_year], y=[obs.observed_temp_mean_c],
+            mode="markers",
+            name=f"Observed ({obs.observed_temp_mean_c:.1f}°C)",
+            marker=dict(color="#ff7f0e", size=12, symbol="star"),
+        ))
+        fig_trend.update_layout(
+            height=300, margin=dict(l=0, r=0, t=10, b=0),
+            legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+            xaxis_title="Year", yaxis_title="Temp (°C)",
+        )
+        st.plotly_chart(fig_trend, use_container_width=True)
+
+        # CDD / HDD grouped bar
+        st.markdown('<p class="section-header">Degree Day Comparison</p>',
+                    unsafe_allow_html=True)
+        fig_dd = go.Figure(data=[
+            go.Bar(name="Observed", x=["CDD", "HDD"],
+                   y=[ctx.cdd_observed, ctx.hdd_observed],
+                   marker_color=["#d62728", "#1f77b4"]),
+            go.Bar(name="Baseline mean", x=["CDD", "HDD"],
+                   y=[ctx.cdd_baseline, ctx.hdd_baseline],
+                   marker_color=["rgba(214,39,40,0.35)", "rgba(31,119,180,0.35)"]),
+        ])
+        fig_dd.update_layout(
+            barmode="group", height=240,
+            margin=dict(l=0, r=0, t=10, b=0),
+            legend=dict(orientation="h", yanchor="bottom", y=1.02),
+            yaxis_title="Degree-days (°·days)",
+        )
+        st.plotly_chart(fig_dd, use_container_width=True)
+
+        # Wet-bulb gauge
+        if wb > 0:
+            st.markdown('<p class="section-header">Heat Stress Gauge</p>',
+                        unsafe_allow_html=True)
+            fig_gauge = go.Figure(go.Indicator(
+                mode="gauge+number+delta",
+                value=wb,
+                delta={"reference": b_mean, "valueformat": ".1f"},
+                title={"text": "Wet-bulb temp (°C)", "font": {"size": 13}},
+                gauge={
+                    "axis": {"range": [0, 40], "tickwidth": 1},
+                    "bar": {"color": "#d62728"},
+                    "steps": [
+                        {"range": [0, 24], "color": "#d4edda"},
+                        {"range": [24, 28], "color": "#fff3cd"},
+                        {"range": [28, 31], "color": "#ffc107"},
+                        {"range": [31, 35], "color": "#fd7e14"},
+                        {"range": [35, 40], "color": "#dc3545"},
+                    ],
+                    "threshold": {
+                        "line": {"color": "black", "width": 3},
+                        "thickness": 0.75,
+                        "value": wb,
+                    },
+                },
+            ))
+            fig_gauge.update_layout(height=220, margin=dict(l=20, r=20, t=20, b=0))
+            st.plotly_chart(fig_gauge, use_container_width=True)
+
+    # Trend slope interpretation
+    trend = ctx.trend_slope_c_per_decade
+    if abs(trend) >= 0.05:
+        direction = "warming" if trend > 0 else "cooling"
+        st.info(
+            f"📈 **10-year trend signal:** {direction} at {abs(trend):.3f} °C/decade "
+            f"(linear regression on 2011–2020 within the 1991–2020 baseline). "
+            "This is a climate shift signal, distinct from the Z-score short-term anomaly."
+        )
+
+
+# ── Tab: Precipitation & Drought ─────────────────────────────────────────────
+
+with tab_precip:
+    st.markdown("### Precipitation Anomaly & Drought Risk")
+
+    col_left, col_right = st.columns([1, 1], gap="large")
+
+    with col_left:
+        pz = ctx.precip_z_score
+        pcls = ctx.precip_anomaly_classification
+        abs_pz = abs(pz)
+        p_direction = "wetter" if pz > 0 else "drier"
+
+        st.markdown('<p class="section-header">Precipitation Signal</p>',
+                    unsafe_allow_html=True)
+
+        pm1, pm2, pm3 = st.columns(3)
+        with pm1:
+            st.metric("Observed precip.", f"{ctx.precip_observed_mm:.1f} mm")
+        with pm2:
+            st.metric("Baseline mean", f"{ctx.precip_baseline_mm:.1f} mm")
+        with pm3:
+            delta_mm = ctx.precip_observed_mm - ctx.precip_baseline_mm
+            st.metric("Delta", f"{delta_mm:+.1f} mm",
+                      delta_color="inverse" if pz > 0 else "normal")
+
+        st.metric("Precip Z-score", f"{pz:+.2f} σ")
+
+        if pz == 0.0 and ctx.precip_baseline_mm == 0.0:
+            st.warning("⚠️ Precipitation baseline data unavailable for this location/period.")
+        elif abs_pz <= Z_NORMAL:
+            st.info(f"🔵 **Within normal variability** — Z = {pz:+.2f}σ.")
+        elif abs_pz > Z_EXCEPTIONAL:
+            st.error(f"🔴 **Exceptional precipitation anomaly** — {abs_pz:.2f}σ {p_direction}.")
+        else:
+            st.warning(f"🟡 **Notable precipitation anomaly** — {abs_pz:.2f}σ {p_direction}.")
+
+        # Flood risk signal
+        st.markdown('<p class="section-header" style="margin-top:16px">Flood Risk Signal</p>',
+                    unsafe_allow_html=True)
+        if pz >= Z_EXCEPTIONAL:
+            st.error(
+                "🚨 **Elevated flood risk signal** — precipitation is more than 3σ above "
+                "baseline. Assess drainage capacity and surface water management."
+            )
+        elif pz >= Z_NORMAL:
+            st.warning(
+                "🟡 **Moderate excess precipitation** — above-baseline rainfall may increase "
+                "localised flood exposure. Monitor river levels and stormwater infrastructure."
+            )
+        else:
+            st.info("🔵 No significant flood risk signal from precipitation anomaly.")
+
+        # Drought indicator
+        st.markdown('<p class="section-header" style="margin-top:16px">Drought Indicator</p>',
+                    unsafe_allow_html=True)
+        drought = ctx.drought_indicator
+        if drought == "severe":
+            st.error(
+                "🔴 **Severe drought indicator** — precipitation Z-score ≤ −3σ. "
+                "Significant moisture deficit; water resource stress is likely."
+            )
+        elif drought == "moderate":
+            st.warning(
+                "🟡 **Moderate drought indicator** — precipitation Z-score ≤ −1.5σ. "
+                "Below-normal rainfall; monitor soil moisture and reservoir levels."
+            )
+        else:
+            st.success("🟢 No drought signal — precipitation is at or above baseline levels.")
+
+    with col_right:
+        st.markdown('<p class="section-header">Precipitation vs. Baseline (per year)</p>',
+                    unsafe_allow_html=True)
+
+        years_p, totals_p = _year_annual_precip(baseline_series)
+        fitted_p, slope_p = _linear_fit(years_p, totals_p)
+
+        if years_p:
+            fig_precip = go.Figure()
+            fig_precip.add_trace(go.Bar(
+                x=years_p, y=totals_p,
+                name="Baseline annual precip",
+                marker_color="rgba(31,119,180,0.55)",
+            ))
+            fig_precip.add_trace(go.Scatter(
+                x=years_p, y=fitted_p,
+                mode="lines",
+                name=f"Trend ({slope_p * 10:+.1f} mm/decade)",
+                line=dict(color="#d62728", width=2, dash="dot"),
+            ))
+            fig_precip.add_hline(
+                y=ctx.precip_baseline_mm,
+                line_dash="dash", line_color="grey", line_width=1,
+                annotation_text=f"Monthly mean {ctx.precip_baseline_mm:.0f} mm",
+            )
+            # Observed value
+            obs_year_p = datetime.fromisoformat(obs.date_range_end).year
+            fig_precip.add_trace(go.Scatter(
+                x=[obs_year_p], y=[ctx.precip_observed_mm],
+                mode="markers",
+                name=f"Observed ({ctx.precip_observed_mm:.0f} mm)",
+                marker=dict(color="#ff7f0e", size=12, symbol="star"),
+            ))
+            fig_precip.update_layout(
+                height=320, margin=dict(l=0, r=0, t=10, b=0),
+                legend=dict(orientation="h", yanchor="bottom", y=1.02),
+                xaxis_title="Year", yaxis_title="Precip (mm)",
+            )
+            st.plotly_chart(fig_precip, use_container_width=True)
+
+        # Observed vs. baseline bar
+        st.markdown('<p class="section-header">Observed vs. Baseline</p>',
+                    unsafe_allow_html=True)
+        fig_pb = go.Figure(data=[
+            go.Bar(
+                x=["Observed", "Baseline mean"],
+                y=[ctx.precip_observed_mm, ctx.precip_baseline_mm],
+                marker_color=["#ff7f0e", "rgba(31,119,180,0.55)"],
+                text=[f"{ctx.precip_observed_mm:.1f} mm", f"{ctx.precip_baseline_mm:.1f} mm"],
+                textposition="outside",
+            )
+        ])
+        fig_pb.update_layout(
+            height=240, margin=dict(l=0, r=0, t=10, b=20),
+            yaxis_title="Precipitation (mm)",
+        )
+        st.plotly_chart(fig_pb, use_container_width=True)
+
+
+# ── Tab: Wind ────────────────────────────────────────────────────────────────
+
+with tab_wind:
+    st.markdown("### Wind Speed Anomaly")
+
+    col_left, col_right = st.columns([1, 1], gap="large")
+
+    with col_left:
+        wz = ctx.wind_z_score
+        wcls = ctx.wind_anomaly_classification
+        wobs = ctx.wind_speed_max_ms
+        wbase = ctx.wind_baseline_ms
+
+        st.markdown('<p class="section-header">Wind Signal</p>', unsafe_allow_html=True)
+
+        if wobs == 0.0:
+            st.warning(
+                "⚠️ Wind speed data was not returned by the archive API for this location "
+                "and period. Wind anomaly analysis is unavailable."
+            )
+        else:
+            wm1, wm2, wm3 = st.columns(3)
+            with wm1:
+                st.metric("Observed (mean daily max)", f"{wobs:.1f} m/s")
+            with wm2:
+                st.metric("Baseline mean", f"{wbase:.1f} m/s")
+            with wm3:
+                st.metric("Wind Z-score", f"{wz:+.2f} σ")
+
+            abs_wz = abs(wz)
+            w_direction = "stronger" if wz > 0 else "weaker"
+            if abs_wz <= Z_NORMAL:
+                st.info(f"🔵 **Within normal variability** — wind Z = {wz:+.2f}σ.")
+            elif abs_wz > Z_EXCEPTIONAL:
+                st.error(f"🔴 **Exceptional wind anomaly** — {abs_wz:.2f}σ {w_direction} than baseline.")
+            else:
+                st.warning(f"🟡 **Notable wind anomaly** — {abs_wz:.2f}σ {w_direction} than baseline.")
+
+            # Beaufort scale reference
+            st.markdown('<p class="section-header" style="margin-top:16px">Reference Scale</p>',
+                        unsafe_allow_html=True)
+            beaufort = [
+                (0, 0.5, "Calm"), (0.5, 1.5, "Light air"), (1.5, 3.3, "Light breeze"),
+                (3.3, 5.5, "Gentle breeze"), (5.5, 7.9, "Moderate breeze"),
+                (7.9, 10.7, "Fresh breeze"), (10.7, 13.8, "Strong breeze"),
+                (13.8, 17.1, "Near gale"), (17.1, 20.7, "Gale"),
+                (20.7, 24.4, "Strong gale"), (24.4, 28.4, "Storm"),
+                (28.4, 32.6, "Violent storm"), (32.6, 999, "Hurricane"),
+            ]
+            for low, high, name in beaufort:
+                if low <= wobs < high:
+                    st.info(f"🌬️ **{wobs:.1f} m/s** falls in the Beaufort **{name}** category.")
+                    break
+
+    with col_right:
+        if wobs > 0:
+            st.markdown('<p class="section-header">Wind: Observed vs. Baseline</p>',
+                        unsafe_allow_html=True)
+            fig_wind = go.Figure(data=[
+                go.Bar(
+                    x=["Observed", "Baseline mean"],
+                    y=[wobs, wbase],
+                    marker_color=["#9467bd", "rgba(148,103,189,0.4)"],
+                    text=[f"{wobs:.1f} m/s", f"{wbase:.1f} m/s"],
+                    textposition="outside",
+                )
+            ])
+            fig_wind.update_layout(
+                height=300, margin=dict(l=0, r=0, t=10, b=20),
+                yaxis_title="Wind speed (m/s)",
+            )
+            st.plotly_chart(fig_wind, use_container_width=True)
+
+            # Z-score waterfall style indicator
+            st.markdown('<p class="section-header">Z-score Indicator</p>',
+                        unsafe_allow_html=True)
+            fig_wz = go.Figure(go.Indicator(
+                mode="number+gauge+delta",
+                value=wz,
+                delta={"reference": 0, "valueformat": "+.2f"},
+                title={"text": "Wind Z-score (σ)"},
+                gauge={
+                    "axis": {"range": [-4, 4], "tickwidth": 1},
+                    "bar": {"color": "#9467bd"},
+                    "steps": [
+                        {"range": [-4, -Z_EXCEPTIONAL], "color": "#d62728"},
+                        {"range": [-Z_EXCEPTIONAL, -Z_NORMAL], "color": "#ff7f0e"},
+                        {"range": [-Z_NORMAL, Z_NORMAL], "color": "#2ca02c"},
+                        {"range": [Z_NORMAL, Z_EXCEPTIONAL], "color": "#ff7f0e"},
+                        {"range": [Z_EXCEPTIONAL, 4], "color": "#d62728"},
+                    ],
+                    "threshold": {
+                        "line": {"color": "black", "width": 3},
+                        "thickness": 0.75,
+                        "value": wz,
+                    },
+                },
+            ))
+            fig_wz.update_layout(height=220, margin=dict(l=20, r=20, t=20, b=0))
+            st.plotly_chart(fig_wz, use_container_width=True)
+
+
+# ── Tab: Economic Impact ──────────────────────────────────────────────────────
+
+with tab_econ:
+    st.markdown("### Economic Impact Estimate")
+    st.caption(
+        "Additional cooling energy expenditure attributable to the CDD anomaly — "
+        "per 100 m² residential unit for the observation period."
+    )
+
+    tier = eco.electricity_price_tier
+    cost = eco.delta_energy_cost_usd
+    uncertainty = eco.uncertainty_band_pct
+    price = eco.electricity_price_per_kwh_usd
+    source = eco.electricity_price_source
+
+    tier_icons = {1: "🟢", 2: "🟢", 3: "🟡", 4: "🟠", 5: "🔴"}
+    tier_icon = tier_icons.get(tier, "⚪")
+
+    if tier >= 4:
+        st.warning(
+            f"⚠️ **Estimated — Regional Proxy** — {loc.city_name} ({loc.country}) "
+            f"falls into Pricing **Tier {tier}** ({source}). No direct electricity price data "
+            f"is available. Uncertainty band: **±{uncertainty:.0f}%**."
+        )
+
+    ec1, ec2, ec3, ec4 = st.columns(4)
+    with ec1:
+        st.metric(f"Electricity price  {tier_icon} Tier {tier}", f"${price:.3f}/kWh",
+                  help=f"Source: {source}")
+    with ec2:
+        st.metric("Uncertainty band", f"±{uncertainty:.0f}%")
+    with ec3:
+        st.metric("Economic confidence", eco.confidence.capitalize())
+    with ec4:
+        if cost > 0:
+            st.metric("Additional cooling cost", f"${cost:.2f} USD",
+                      delta_color="inverse")
+        else:
+            st.metric("Additional cooling cost", "None")
+
+    if cost > 0:
+        margin = cost * uncertainty / 100.0
+        low_c = max(0.0, cost - margin)
+        high_c = cost + margin
+
+        st.caption(f"_{eco.per_unit_description}_  ·  Tier {tier} · {source}")
+
+        # Range visualisation
+        fig_cost = go.Figure()
+        fig_cost.add_trace(go.Bar(
+            x=["Estimated additional cost"],
+            y=[cost],
+            error_y=dict(type="data", symmetric=False,
+                         array=[high_c - cost], arrayminus=[cost - low_c]),
+            marker_color="#ff7f0e",
+            text=[f"${cost:.2f}"],
+            textposition="outside",
+        ))
+        fig_cost.add_hline(y=0, line_color="grey", line_width=1)
+        fig_cost.update_layout(
+            height=280, margin=dict(l=0, r=0, t=20, b=0),
+            yaxis_title="USD",
+            title=f"Cost range: ${low_c:.2f} – ${high_c:.2f} USD",
+        )
+        st.plotly_chart(fig_cost, use_container_width=True)
+
+    else:
+        st.info(
+            "💡 **No additional cooling cost estimated.** "
+            "Observed CDD is at or below the 1991–2020 baseline."
+        )
+
+    if ctx.confidence_note:
+        with st.expander("Data quality notes", expanded=False):
+            st.caption(ctx.confidence_note)
+
+
+# ── Tab: Methodology ─────────────────────────────────────────────────────────
+
+with tab_method:
+    st.markdown("## Methodology & Data Sources")
+
     st.markdown("""
 ### Baseline Period
 All statistics use the **1991–2020 WMO 30-year climatological normal** — the current
 international standard reference period (World Meteorological Organisation, 2020).
-This window captures recent observed climate while providing sufficient length for
-robust statistical estimation.
 
 ---
 
 ### Z-score Anomaly Detection
-The anomaly metric is the **Z-score**:
-
 ```
 Z = (observed period mean − 1991–2020 baseline mean) / baseline standard deviation
 ```
 
-Thresholds (scientifically non-negotiable):
-
-| Z-score | Classification | Interpretation |
-|---------|---------------|----------------|
+| Z-score | Classification | Action |
+|---------|---------------|--------|
 | abs(Z) ≤ 1.5σ | Normal | Within seasonal variability — no anomaly narrative |
 | 1.5σ < abs(Z) ≤ 3.0σ | Notable | Climate-context weather anomaly |
 | abs(Z) > 3.0σ | Exceptional | Rare statistical departure |
 
+Applied to: **temperature**, **precipitation**, and **wind speed** independently.
+
 ---
 
 ### Stull (2011) Wet-bulb Temperature
-Wet-bulb temperature is computed from dry-bulb temperature and relative humidity
-using the **Stull (2011)** empirical approximation:
+Computed from dry-bulb temperature and relative humidity (derived from dewpoint via
+August-Roche-Magnus formula). Valid 5–40 °C, 5–99% RH; accuracy ±1 °C.
 
-> Stull, R. (2011). "Wet-Bulb Temperature from Relative Humidity and Air Temperature."
-> *Journal of Applied Meteorology and Climatology*, 50(11), 2267–2269.
-
-Relative humidity is derived from dry-bulb and dewpoint via the August-Roche-Magnus
-formula. Valid range: 5–40 °C, 5–99% RH. Typical accuracy: ±1 °C.
-
-Wet-bulb temperature captures both heat and humidity simultaneously — it is the
-primary physiological heat stress metric, not dry-bulb temperature alone.
+> Stull, R. (2011). *Journal of Applied Meteorology and Climatology*, 50(11), 2267–2269.
 
 ---
 
 ### Cooling/Heating Degree Days (CDD/HDD)
-Degree days quantify departure from a **base temperature of 18 °C** (WMO standard):
+Base temperature: **18 °C** (WMO standard).
+- CDD = max(0, T_mean − 18 °C) per day — proxy for cooling energy demand
+- HDD = max(0, 18 °C − T_mean) per day — proxy for heating energy demand
 
-- **CDD** = max(0, T_mean − 18 °C) per day — proxy for cooling energy demand
-- **HDD** = max(0, 18 °C − T_mean) per day — proxy for heating energy demand
-
-Baseline CDD/HDD are computed from actual 1991–2020 daily records; observed
-values use the period-mean approximation.
-
-Energy cost formula:
+Energy cost:
 ```
 ΔCost = CDD_delta × 100 m² × 0.06 kWh/m²/°-day × price_per_kWh
 ```
-(IEA conservative residential efficiency baseline)
+
+---
+
+### Precipitation Anomaly & Drought
+Monthly precipitation totals are compared against the same calendar month across 1991–2020.
+A Z-score ≤ −1.5σ triggers a **moderate drought indicator**; ≤ −3σ triggers **severe**.
+
+---
+
+### Wind Anomaly
+Mean daily maximum wind speeds over the observation period are compared against the
+1991–2020 baseline distribution for the same calendar month.
 
 ---
 
@@ -534,17 +980,11 @@ Energy cost formula:
 | 🟠 4 | Emerging markets (India, Brazil, South Africa…) | World Bank Energy Data | ±40% |
 | 🔴 5 | All others | Regional median proxy | ±60% |
 
-Countries in Tier 4 or 5 are labelled **Estimated — Regional Proxy** and carry
-high uncertainty. All estimates are per **100 m² residential unit** for the
-observation period.
-
 ---
 
 ### Trend Signal
-The 10-year trend slope is computed by linear regression on annual mean temperatures
-for the years **2011–2020** within the 1991–2020 baseline series. The result is
-expressed in °C/decade. This is a climate shift signal distinct from the Z-score
-short-term weather anomaly signal.
+Linear regression on annual mean temperatures for 2011–2020 within the 1991–2020
+baseline. Expressed in °C/decade. Distinct from the Z-score short-term anomaly.
 
 ---
 

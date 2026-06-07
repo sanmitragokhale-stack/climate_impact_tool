@@ -127,6 +127,19 @@ def compute_climate_context(
     # --- 10-year trend slope ---
     trend = _trend_slope(baseline_series)
 
+    # --- Precipitation anomaly ---
+    precip_z, precip_base_mm, precip_cls = _precip_anomaly(
+        observation.observed_precip_sum_mm, baseline_series
+    )
+
+    # --- Wind anomaly ---
+    wind_z, wind_base_ms, wind_cls = _wind_anomaly(
+        observation.wind_speed_max_ms, baseline_series
+    )
+
+    # --- Drought indicator ---
+    drought = _drought_indicator(precip_z)
+
     # --- Confidence and notes ---
     confidence, note = _assess_confidence(observation, null_fraction, z)
 
@@ -145,6 +158,15 @@ def compute_climate_context(
         hdd_delta=round(hdd_obs - hdd_base, 1),
         wet_bulb_temp_c=round(wet_bulb, 2),
         trend_slope_c_per_decade=round(trend, 3),
+        precip_observed_mm=round(observation.observed_precip_sum_mm, 1),
+        precip_baseline_mm=round(precip_base_mm, 1),
+        precip_z_score=round(precip_z, 2),
+        precip_anomaly_classification=precip_cls,
+        wind_speed_max_ms=round(observation.wind_speed_max_ms, 1),
+        wind_baseline_ms=round(wind_base_ms, 1),
+        wind_z_score=round(wind_z, 2),
+        wind_anomaly_classification=wind_cls,
+        drought_indicator=drought,
         confidence=confidence,
         confidence_note=note,
     )
@@ -345,6 +367,96 @@ def _trend_slope(baseline_series: list[dict]) -> float:
         return 0.0
 
     return (numerator / denominator) * 10.0   # °C/year → °C/decade
+
+
+# ---------------------------------------------------------------------------
+# Private: Precipitation anomaly
+# ---------------------------------------------------------------------------
+
+def _precip_anomaly(
+    observed_mm: float,
+    baseline_series: list[dict],
+) -> tuple[float, float, str]:
+    """
+    Computes precipitation Z-score from the observed period total and the
+    1991–2020 baseline monthly precip distribution.
+
+    Returns (z_score, baseline_mean_mm, anomaly_classification).
+    Returns (0.0, 0.0, "normal") gracefully when baseline data is sparse.
+    """
+    # Sum precip per year for the filtered month records, then take means
+    year_totals: dict[str, float] = {}
+    for r in baseline_series:
+        if r.get("precip_sum_mm") is not None:
+            year = r["date"][:4]
+            year_totals[year] = year_totals.get(year, 0.0) + r["precip_sum_mm"]
+
+    if len(year_totals) < MIN_BASELINE_RECORDS:
+        return 0.0, 0.0, "normal"
+
+    values = list(year_totals.values())
+    b_mean = mean(values)
+    b_std = stdev(values)
+
+    if b_std == 0.0:
+        return 0.0, b_mean, "normal"
+
+    z = (observed_mm - b_mean) / b_std
+    return z, b_mean, _classify_anomaly(z)
+
+
+# ---------------------------------------------------------------------------
+# Private: Wind anomaly
+# ---------------------------------------------------------------------------
+
+def _wind_anomaly(
+    observed_ms: float,
+    baseline_series: list[dict],
+) -> tuple[float, float, str]:
+    """
+    Computes wind speed Z-score from observed mean-daily-max and baseline.
+
+    Returns (z_score, baseline_mean_ms, anomaly_classification).
+    Returns (0.0, 0.0, "normal") when data is unavailable.
+    """
+    if observed_ms == 0.0:
+        return 0.0, 0.0, "normal"
+
+    year_means: dict[str, list[float]] = {}
+    for r in baseline_series:
+        v = r.get("wind_speed_max_ms")
+        if v is not None:
+            year = r["date"][:4]
+            year_means.setdefault(year, []).append(v)
+
+    if len(year_means) < MIN_BASELINE_RECORDS:
+        return 0.0, 0.0, "normal"
+
+    annual_means = [mean(vals) for vals in year_means.values()]
+    b_mean = mean(annual_means)
+    b_std = stdev(annual_means)
+
+    if b_std == 0.0:
+        return 0.0, b_mean, "normal"
+
+    z = (observed_ms - b_mean) / b_std
+    return z, b_mean, _classify_anomaly(z)
+
+
+# ---------------------------------------------------------------------------
+# Private: Drought indicator
+# ---------------------------------------------------------------------------
+
+def _drought_indicator(precip_z: float) -> str:
+    """
+    Derives a drought risk label from the precipitation Z-score.
+    A strongly negative Z indicates prolonged dryness relative to baseline.
+    """
+    if precip_z <= -3.0:
+        return "severe"
+    if precip_z <= -1.5:
+        return "moderate"
+    return "none"
 
 
 # ---------------------------------------------------------------------------

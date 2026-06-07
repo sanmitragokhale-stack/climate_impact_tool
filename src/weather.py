@@ -42,7 +42,7 @@ ARCHIVE_LAG_DAYS = 5
 MISSING_DATA_THRESHOLD_PCT = 15.0
 
 # Daily variables available in the ERA5 archive at daily resolution
-_DAILY_VARIABLES = "temperature_2m_mean,precipitation_sum"
+_DAILY_VARIABLES = "temperature_2m_mean,precipitation_sum,windspeed_10m_max"
 
 # Hourly dewpoint is requested for the observed period only; not used for the
 # 30-year baseline because the hourly payload would be ~262 800 rows.
@@ -232,6 +232,7 @@ def _fetch_daily_with_dewpoint(
 
     temps = daily_section.get("temperature_2m_mean", [None] * len(dates))
     precips = daily_section.get("precipitation_sum", [None] * len(dates))
+    winds = daily_section.get("windspeed_10m_max", [None] * len(dates))
 
     # Aggregate hourly dewpoint to one mean value per calendar day
     daily_dewpoints = _aggregate_hourly_to_daily(
@@ -245,6 +246,7 @@ def _fetch_daily_with_dewpoint(
             "temp_mean_c": temps[i] if i < len(temps) else None,
             "precip_sum_mm": precips[i] if i < len(precips) else None,
             "dewpoint_mean_c": daily_dewpoints.get(dates[i]),
+            "wind_speed_max_ms": winds[i] if i < len(winds) else None,
         }
         for i in range(len(dates))
     ]
@@ -285,6 +287,7 @@ def _fetch_daily_only(
 
     temps = daily_section.get("temperature_2m_mean", [None] * len(dates))
     precips = daily_section.get("precipitation_sum", [None] * len(dates))
+    winds = daily_section.get("windspeed_10m_max", [None] * len(dates))
 
     return [
         {
@@ -292,6 +295,7 @@ def _fetch_daily_only(
             "temp_mean_c": temps[i] if i < len(temps) else None,
             "precip_sum_mm": precips[i] if i < len(precips) else None,
             "dewpoint_mean_c": None,
+            "wind_speed_max_ms": winds[i] if i < len(winds) else None,
         }
         for i in range(len(dates))
     ]
@@ -412,6 +416,7 @@ def _build_weather_observation(
     temps = [r["temp_mean_c"] for r in records if r["temp_mean_c"] is not None]
     precips = [r["precip_sum_mm"] for r in records if r["precip_sum_mm"] is not None]
     dewpoints = [r["dewpoint_mean_c"] for r in records if r["dewpoint_mean_c"] is not None]
+    winds = [r["wind_speed_max_ms"] for r in records if r.get("wind_speed_max_ms") is not None]
 
     if not temps:
         raise ValueError(
@@ -429,6 +434,7 @@ def _build_weather_observation(
         observed_temp_mean_c=round(mean(temps), 2),
         observed_precip_sum_mm=round(sum(precips), 2) if precips else 0.0,
         dewpoint_mean_c=round(mean(dewpoints), 2) if dewpoints else 0.0,
+        wind_speed_max_ms=round(mean(winds), 2) if winds else 0.0,
         data_source="open-meteo",
         data_quality_flag=quality_flag,
     )
