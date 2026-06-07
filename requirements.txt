@@ -15,5 +15,3 @@ anthropic>=0.40.0
 
 # Interactive visualisation charts
 plotly==5.22.0
-
-pillow==11.1.0
