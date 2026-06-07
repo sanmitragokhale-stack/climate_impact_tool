@@ -10,3 +10,5 @@ streamlit==1.35.0
 # Data handling (needed from Slice 3 onward, pin early)
 pandas==2.2.2
 numpy==1.26.4
+
+anthropic>=0.40.0
