@@ -5,13 +5,13 @@ requests==2.31.0
 python-dotenv==1.0.1
 
 # Streamlit UI (not used in Slice 1, but pin it now)
-streamlit==1.41.0
+streamlit>=1.41.0
 
 # Data handling (needed from Slice 3 onward, pin early)
-pandas==2.2.2
-numpy==1.26.4
+pandas>=2.2.2
+numpy>=1.26.4
 
 anthropic>=0.40.0
 
 # Interactive visualisation charts
-plotly==5.22.0
+plotly>=5.22.0
