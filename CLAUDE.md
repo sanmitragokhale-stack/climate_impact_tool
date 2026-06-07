@@ -142,9 +142,14 @@ The Claude system prompt must instruct the model to:
 
 | Slice | Module | Status |
 |-------|--------|--------|
-| 1 | `geocoding.py` + `schema.py` | ✅ Complete |
-| 2 | `weather.py` | ⬜ Next |
-| 3 | `climate_stats.py` | ⬜ Pending |
-| 4 | `economic_impact.py` | ⬜ Pending |
-| 5 | `llm_synthesis.py` | ⬜ Pending |
-| 6 | `app.py` (Streamlit UI) | ⬜ Pending |
+| | 1 | geocoding.py        | ✅ Complete |
+| 2 | weather.py          | ✅ Complete |
+| 3 | climate_stats.py    | ✅ Complete |
+| 4 | economic_impact.py  | ✅ Complete |
+| 5 | llm_synthesis.py    | ✅ Complete |
+| 6 | app.py (Streamlit)  | ✅ Complete |
+
+
+## Current Status
+All 6 slices complete. 153+ tests passing. App runs locally via `streamlit run app.py`.
+Next steps: Deploy to Streamlit Community Cloud. Write README.md and DECISIONS.md.
