@@ -399,7 +399,10 @@ st.caption(
     "**C**limate trend context · **A**ctionable framing"
 )
 with st.container(border=True):
-    st.markdown(narrative)
+    # Escape literal "$" so Streamlit/KaTeX doesn't treat currency figures
+    # (e.g. "$45.58 ... $27.35-$63.81") as paired LaTeX math delimiters —
+    # that pairing strips whitespace and switches to an italic math font.
+    st.markdown(narrative.replace("$", r"\$"))
 
 st.divider()
 
