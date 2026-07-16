@@ -82,10 +82,29 @@ Source: initial user feedback round, collected [date]. Organized by branch/track
 
 ---
 
+## Track 8 — Fallback narrative hazard-classification bug (correctness fix, higher priority than numbering suggests)
+
+**Branch:** `fix/fallback-narrative-hazard-classification`
+
+**Origin:** discovered during Track 2's codebase check, deliberately deferred out of that branch to keep it scoped to disclosure only.
+
+**The bug:** `_fallback_narrative()` in `llm_synthesis.py` (the deterministic template used whenever the live LLM/API path is unavailable — which is the current default behavior in this environment, since no API key is set) decides whether to use "normal" or "anomaly" language based on the temperature classification only. It never reads `precip_z_score`, `wind_z_score`, or `drought_indicator`. Practical effect: if temperature is normal but precipitation or wind is independently flagged as notable/exceptional (e.g. a real flood or windstorm signal), the fallback narrative can say "conditions fall within normal operational parameters" — actively burying a real, already-detected hazard. This is a correctness issue, not a coverage gap: the live LLM path is instructed to mention flood/drought/wind qualitatively in Actionable Framing; the fallback path currently never does, in any of the four LPCA beats.
+
+**Scope of the real fix (per Claude Code's assessment during Track 2):**
+- Fix branch-selection logic to check all three hazard classifications (temp, precip/drought, wind), not temperature alone.
+- Bring precip/wind/drought mentions into all four LPCA beats in the fallback template, at parity with the live LLM path.
+- Add new test coverage — zero of the existing 38 `test_llm_synthesis.py` tests currently touch precip/wind/drought, so this isn't just editing existing tests.
+
+**Why it's flagged as higher priority than its position in this list:** unlike the other deferred/v2 items, this is a silent-failure bug on the app's default runtime path (fallback template), not a missing feature. Worth considering for the next branch after Track 2 merges, ahead of Track 3, rather than waiting for its numeric turn.
+
+---
+
 ## Suggested build order
 
-1. Track 1 (quick fix) — fast, low-risk, unblocks nothing else, good first PR.
-2. Track 2 and Track 3 — can run roughly in parallel, don't touch the same files.
-3. Track 7 (research + site agents) — separate CI/automation concern, can proceed alongside 2–3.
-4. Track 4 (user data override) — slow track, full grill-me spec pass required before any code.
-5. Track 6 (Next.js rebuild, incl. Track 5's design system) — last, once backend/data model is stable.
+1. ~~Track 1 (quick fix)~~ — **done, merged.**
+2. ~~Track 2 (economic scope transparency)~~ — **done, merged.**
+3. **Track 8 (fallback narrative hazard-classification bug)** — discovered during Track 2, correctness issue on the app's default runtime path. Recommend doing this next, ahead of Track 3, despite its numbering.
+4. Track 3 — event timeline. Can run in parallel with Track 7 if desired.
+5. Track 7 (research + site agents) — separate CI/automation concern.
+6. Track 4 (user data override) — slow track, full grill-me spec pass required before any code.
+7. Track 6 (Next.js rebuild, incl. Track 5's design system) — last, once backend/data model is stable.
