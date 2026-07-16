@@ -845,6 +845,14 @@ with tab_econ:
         "Additional cooling energy expenditure attributable to the CDD anomaly — "
         "per 100 m² residential unit for the observation period."
     )
+    st.info(
+        "ℹ️ **Scope note** — This tab estimates additional **cooling energy cost** "
+        "only, derived from the temperature (CDD) anomaly. The precipitation/"
+        "drought and wind hazards shown in their own tabs do not currently have "
+        "an associated economic cost estimate — credible flood or wind damage "
+        "cost modeling requires actuarial-grade exposure and vulnerability data "
+        "this tool does not yet have."
+    )
 
     tier = eco.electricity_price_tier
     cost = eco.delta_energy_cost_usd
