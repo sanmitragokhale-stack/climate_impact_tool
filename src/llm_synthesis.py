@@ -220,6 +220,11 @@ def _season_from_dates(start: str, end: str) -> str:
     return seasons.get(month, "the observation period")
 
 
+def _severity_word(classification: str) -> str:
+    """'exceptional' or 'notable' — matches climate_stats.py's two-tier anomaly language."""
+    return "exceptional" if classification == "exceptional" else "notable"
+
+
 def _fallback_narrative(impact: EconomicImpact, payload: dict) -> str:
     """
     Builds a deterministic LPCA narrative from the pre-extracted payload dict.
@@ -254,6 +259,17 @@ def _fallback_narrative(impact: EconomicImpact, payload: dict) -> str:
     econ_conf = payload["economic_confidence"]
     climate_conf = payload["climate_confidence"]
 
+    precip_z = payload["precip_z_score"]
+    precip_cls = payload["precip_anomaly_classification"]
+    precip_observed_mm = payload["precip_observed_mm"]
+    precip_baseline_mm = payload["precip_baseline_mm"]
+    drought_indicator = payload["drought_indicator"]
+
+    wind_z = payload["wind_z_score"]
+    wind_cls = payload["wind_anomaly_classification"]
+    wind_observed_ms = payload["wind_speed_max_ms"]
+    wind_baseline_ms = payload["wind_baseline_ms"]
+
     tier_badge = " [Estimated — Regional Proxy]" if tier >= 4 else ""
     abs_z = abs(z)
     direction = "above" if z > 0 else "below"
@@ -283,6 +299,27 @@ def _fallback_narrative(impact: EconomicImpact, payload: dict) -> str:
                 f" Wet-bulb temperature reached {wet_bulb:.1f}°C — the primary "
                 f"heat stress indicator."
             )
+
+    # Precip/wind are gated independently of the temperature classification above —
+    # a temp-normal period can still carry a real precip or wind anomaly, and that
+    # must not be silently dropped (see Track 8 / fallback-narrative-hazard-classification).
+    if precip_cls != "normal":
+        p_severity = _severity_word(precip_cls)
+        p_direction = "above" if precip_z > 0 else "below"
+        flood_or_drought = "flood" if precip_z > 0 else "drought"
+        local_anchor += (
+            f" Precipitation was also {p_severity} — {abs(precip_z):.2f}σ "
+            f"{p_direction} the seasonal baseline, a signal consistent with "
+            f"{flood_or_drought} risk."
+        )
+
+    if wind_cls != "normal":
+        w_severity = _severity_word(wind_cls)
+        w_direction = "above" if wind_z > 0 else "below"
+        local_anchor += (
+            f" Wind speeds were also {w_severity} — {abs(wind_z):.2f}σ "
+            f"{w_direction} the seasonal baseline."
+        )
 
     # ── P: Present Consequence ───────────────────────────────────────────────
 
@@ -330,6 +367,22 @@ def _fallback_narrative(impact: EconomicImpact, payload: dict) -> str:
             f"is attributed to this period."
         )
 
+    if precip_cls != "normal":
+        flood_or_drought = "flood" if precip_z > 0 else "drought"
+        drought_str = f" Drought indicator: {drought_indicator}." if drought_indicator != "none" else ""
+        present_consequence += (
+            f" Precipitation totalled {precip_observed_mm:.1f} mm against a "
+            f"{precip_baseline_mm:.1f} mm baseline ({precip_z:+.2f}σ), indicating "
+            f"elevated {flood_or_drought} risk.{drought_str}"
+        )
+
+    if wind_cls != "normal":
+        present_consequence += (
+            f" Wind speeds reached {wind_observed_ms:.1f} m/s against a "
+            f"{wind_baseline_ms:.1f} m/s baseline ({wind_z:+.2f}σ), indicating "
+            f"elevated wind risk."
+        )
+
     # ── C: Trend Context ─────────────────────────────────────────────────────
 
     if abs(trend) < 0.05:
@@ -357,37 +410,62 @@ def _fallback_narrative(impact: EconomicImpact, payload: dict) -> str:
         )
 
     # ── A: Actionable Framing ────────────────────────────────────────────────
+    # Each hazard contributes its own clause independently — see Local Anchor
+    # comment above. If none of the three hazards are anomalous, actionable_parts
+    # stays empty and we fall back to the single "normal operations" sentence.
 
-    if classification == "normal":
+    actionable_parts = []
+
+    if classification != "normal":
+        temp_parts = [
+            "From a risk-management standpoint, this event warrants review of "
+            "short-term energy procurement and cooling infrastructure capacity."
+        ]
+        if cost > 0:
+            temp_parts.append(
+                f"The estimated cost impact of ${cost:.2f} USD {per_unit} carries "
+                f"a ±{uncertainty:.0f}% uncertainty band "
+                f"(Tier {tier} pricing, economic confidence: {econ_conf}){tier_badge}."
+            )
+        if trend > 0.1:
+            temp_parts.append(
+                "The positive decadal trend suggests events of this magnitude may "
+                "recur more frequently, supporting the case for proactive adaptation."
+            )
+        temp_parts.append(
+            "Adaptation options include demand-side management programmes, "
+            "cool-roof and building insulation upgrades, and review of utility "
+            "hedging strategies."
+        )
+        actionable_parts.append(" ".join(temp_parts))
+
+    if precip_cls != "normal":
+        flood_or_drought = "flood" if precip_z > 0 else "drought"
+        adaptation = (
+            "drainage capacity and stormwater infrastructure" if flood_or_drought == "flood"
+            else "water-resource contingency and irrigation or supply planning"
+        )
+        actionable_parts.append(
+            f"From a {flood_or_drought} risk-management perspective, this "
+            f"precipitation anomaly warrants review of {adaptation}."
+        )
+
+    if wind_cls != "normal":
+        actionable_parts.append(
+            "Elevated wind risk warrants review of structural wind-loading "
+            "exposure and operational contingency planning for wind-sensitive "
+            "infrastructure."
+        )
+
+    if actionable_parts:
+        actionable = "**Actionable Framing** — " + " ".join(actionable_parts)
+    else:
         actionable = (
             f"**Actionable Framing** — Conditions fall within normal operational "
             f"parameters. Routine energy budgets and cooling or heating "
             f"infrastructure plans based on historical norms remain appropriate. "
             f"Continue monitoring for persistent deviations in subsequent periods."
         )
-    else:
-        parts = [
-            "**Actionable Framing** — From a risk-management standpoint, this "
-            "event warrants review of short-term energy procurement and cooling "
-            "infrastructure capacity."
-        ]
-        if cost > 0:
-            parts.append(
-                f"The estimated cost impact of ${cost:.2f} USD {per_unit} carries "
-                f"a ±{uncertainty:.0f}% uncertainty band "
-                f"(Tier {tier} pricing, economic confidence: {econ_conf}){tier_badge}."
-            )
-        if trend > 0.1:
-            parts.append(
-                "The positive decadal trend suggests events of this magnitude may "
-                "recur more frequently, supporting the case for proactive adaptation."
-            )
-        parts.append(
-            "Adaptation options include demand-side management programmes, "
-            "cool-roof and building insulation upgrades, and review of utility "
-            "hedging strategies."
-        )
-        actionable = " ".join(parts)
 
     # ── Assemble ─────────────────────────────────────────────────────────────
 

@@ -66,6 +66,15 @@ def _make_impact(
     delta_energy_cost_usd: float = 14.40,
     uncertainty_band_pct: float = 15.0,
     econ_confidence: str = "high",
+    precip_z_score: float = 0.0,
+    precip_anomaly_classification: str = "normal",
+    precip_observed_mm: float = 0.0,
+    precip_baseline_mm: float = 0.0,
+    drought_indicator: str = "none",
+    wind_speed_max_ms: float = 0.0,
+    wind_baseline_ms: float = 0.0,
+    wind_z_score: float = 0.0,
+    wind_anomaly_classification: str = "normal",
 ) -> EconomicImpact:
     """
     Builds a fully populated EconomicImpact chain for testing.
@@ -107,6 +116,15 @@ def _make_impact(
         trend_slope_c_per_decade=trend_slope_c_per_decade,
         confidence=climate_confidence,
         confidence_note="",
+        precip_z_score=precip_z_score,
+        precip_anomaly_classification=precip_anomaly_classification,
+        precip_observed_mm=precip_observed_mm,
+        precip_baseline_mm=precip_baseline_mm,
+        drought_indicator=drought_indicator,
+        wind_speed_max_ms=wind_speed_max_ms,
+        wind_baseline_ms=wind_baseline_ms,
+        wind_z_score=wind_z_score,
+        wind_anomaly_classification=wind_anomaly_classification,
     )
     return EconomicImpact(
         climate_context=ctx,
@@ -293,6 +311,129 @@ def test_fallback_normal_classification_contains_all_lpca_headers():
     ]:
         assert header in result, f"Missing header in normal-class output: {header}"
     print("  ✓ Normal classification still produces complete four-section LPCA structure")
+
+
+# ---------------------------------------------------------------------------
+# _fallback_narrative Tests — Independent Multi-Hazard Gating (Track 8)
+#
+# Regression coverage for the bug where branch-selection was keyed on the
+# temperature classification alone: a temp-normal period with a genuinely
+# anomalous precip or wind signal must not be described as "normal
+# operational parameters" — each hazard is gated on its own classification.
+# ---------------------------------------------------------------------------
+
+def test_fallback_temp_normal_precip_notable_flood_not_silenced():
+    """Temp normal + precip notable (wetter) must still surface flood risk language."""
+    impact = _make_impact(
+        z_score=0.3, anomaly_classification="normal", cdd_delta=1.0,
+        delta_energy_cost_usd=0.0,
+        precip_z_score=2.1, precip_anomaly_classification="notable",
+        precip_observed_mm=180.0, precip_baseline_mm=90.0,
+    )
+    result = _fallback_narrative(impact, _build_payload(impact))
+    result_lower = result.lower()
+    assert "flood" in result_lower
+    assert "notable" in result_lower
+    assert "conditions fall within normal operational parameters" not in result_lower
+    print("  ✓ Temp-normal + precip-notable: flood risk language surfaced, not silenced")
+
+
+def test_fallback_temp_normal_precip_notable_drought_not_silenced():
+    """Temp normal + precip notable (drier) must surface drought risk language."""
+    impact = _make_impact(
+        z_score=0.2, anomaly_classification="normal", cdd_delta=1.0,
+        delta_energy_cost_usd=0.0,
+        precip_z_score=-2.3, precip_anomaly_classification="notable",
+        precip_observed_mm=10.0, precip_baseline_mm=90.0,
+        drought_indicator="moderate",
+    )
+    result = _fallback_narrative(impact, _build_payload(impact))
+    result_lower = result.lower()
+    assert "drought" in result_lower
+    assert "moderate" in result_lower
+    print("  ✓ Temp-normal + precip-notable (dry): drought risk + indicator surfaced")
+
+
+def test_fallback_temp_normal_wind_exceptional_not_silenced():
+    """Temp normal + wind exceptional must surface wind risk language, not be hidden."""
+    impact = _make_impact(
+        z_score=0.1, anomaly_classification="normal", cdd_delta=0.0,
+        delta_energy_cost_usd=0.0,
+        wind_z_score=3.4, wind_anomaly_classification="exceptional",
+        wind_speed_max_ms=28.0, wind_baseline_ms=9.0,
+    )
+    result = _fallback_narrative(impact, _build_payload(impact))
+    result_lower = result.lower()
+    # bare "wind" is a substring of "window" (Trend Context always has "2011-2020
+    # window"), so check for actual wind-hazard phrasing, not the bare substring.
+    assert "wind speed" in result_lower or "wind risk" in result_lower
+    assert "exceptional" in result_lower
+    assert "conditions fall within normal operational parameters" not in result_lower
+    print("  ✓ Temp-normal + wind-exceptional: wind risk language surfaced, not silenced")
+
+
+def test_fallback_all_three_hazards_anomalous_all_mentioned():
+    """Temp, precip, and wind all anomalous at once must each get their own clause."""
+    impact = _make_impact(
+        z_score=2.6, anomaly_classification="notable", cdd_delta=10.0,
+        delta_energy_cost_usd=12.0,
+        precip_z_score=-3.2, precip_anomaly_classification="exceptional",
+        precip_observed_mm=5.0, precip_baseline_mm=95.0,
+        drought_indicator="severe",
+        wind_z_score=2.0, wind_anomaly_classification="notable",
+        wind_speed_max_ms=20.0, wind_baseline_ms=10.0,
+    )
+    result = _fallback_narrative(impact, _build_payload(impact))
+    result_lower = result.lower()
+    assert "drought" in result_lower
+    assert "severe" in result_lower
+    assert "wind speed" in result_lower or "wind risk" in result_lower
+    print("  ✓ Triple-hazard anomaly: temp, drought, and wind each surfaced their own clause")
+
+
+def test_fallback_all_hazards_normal_still_collapses_to_variability_note():
+    """Regression: when temp/precip/wind are ALL normal, output stays the short variability note."""
+    impact = _make_impact(
+        z_score=0.4, anomaly_classification="normal", cdd_delta=1.0,
+        delta_energy_cost_usd=0.0,
+        precip_z_score=0.3, precip_anomaly_classification="normal",
+        wind_z_score=-0.2, wind_anomaly_classification="normal",
+    )
+    result = _fallback_narrative(impact, _build_payload(impact))
+    result_lower = result.lower()
+    assert "notable" not in result_lower
+    assert "exceptional" not in result_lower
+    assert "conditions fall within normal operational parameters" in result_lower
+    print("  ✓ All hazards normal: still collapses to the short variability note")
+
+
+def test_fallback_wind_no_data_stays_silent():
+    """Wind data unavailable (0.0 m/s, classification 'normal' per climate_stats.py) adds no clause."""
+    impact = _make_impact(
+        z_score=0.4, anomaly_classification="normal", cdd_delta=1.0,
+        delta_energy_cost_usd=0.0,
+        wind_speed_max_ms=0.0, wind_anomaly_classification="normal",
+    )
+    result = _fallback_narrative(impact, _build_payload(impact))
+    # "wind" alone is a substring of "window" (Trend Context's "2011-2020 window") —
+    # check for actual wind-hazard phrasing instead of the bare substring.
+    assert "wind speed" not in result.lower() and "wind risk" not in result.lower()
+    print("  ✓ No wind data: no wind clause added (consistent with climate_stats.py's 0.0/normal default)")
+
+
+def test_fallback_temp_anomalous_hazard_clauses_appended_not_replaced():
+    """Temp anomaly + wind anomaly: original temp-only wording must still be present, plus wind clause."""
+    impact = _make_impact(
+        z_score=2.7, anomaly_classification="notable", cdd_delta=15.0,
+        delta_energy_cost_usd=14.40,
+        wind_z_score=1.9, wind_anomaly_classification="notable",
+        wind_speed_max_ms=15.0, wind_baseline_ms=8.0,
+    )
+    result = _fallback_narrative(impact, _build_payload(impact))
+    result_lower = result.lower()
+    assert "$14.40" in result
+    assert "wind speed" in result_lower or "wind risk" in result_lower
+    print("  ✓ Temp anomaly + wind anomaly: cost clause intact, wind clause additively appended")
 
 
 # ---------------------------------------------------------------------------
